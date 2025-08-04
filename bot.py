@@ -29,13 +29,14 @@ INVENTORY_FILE = "inventory.json"
 SALES_FILE = "sales.json"
 BLACK_MARKET_USERS_FILE = "black_market_users.json"
 DISCOUNTS_FILE = "discounts.json"
-WEBHOOK_URL = 'http://127.0.0.1:5000'  # Replace with your Render URL
+PENDING_ORDERS_FILE = "pending_orders.json"
+WEBHOOK_URL = "https://your-bot-host/webhook"  # Replace with your Render URL
 
 # Initialize Flask
 app = Flask(__name__)
 
 # Initialize files
-for file in [INVENTORY_FILE, SALES_FILE, BLACK_MARKET_USERS_FILE]:
+for file in [INVENTORY_FILE, SALES_FILE, BLACK_MARKET_USERS_FILE, PENDING_ORDERS_FILE]:
     if not os.path.exists(file):
         with open(file, "w") as f:
             json.dump([], f)
@@ -72,28 +73,43 @@ def save_black_market_users(users):
     with open(BLACK_MARKET_USERS_FILE, "w") as f:
         json.dump(users, f, indent=4)
 
+def load_pending_orders():
+    with open(PENDING_ORDERS_FILE, "r") as f:
+        return json.load(f)
+
+def save_pending_orders(orders):
+    with open(PENDING_ORDERS_FILE, "w") as f:
+        json.dump(orders, f, indent=4)
+
 def generate_screenshot(file_path, output_path):
-    if file_path.endswith(".pdf"):
-        html = f'<iframe src="{file_path}" width="100%" height="100%"></iframe>'
-        HTML(string=html).write_png(output_path)
-    elif file_path.endswith(".txt"):
-        with open(file_path, "r") as f:
-            text = f.read()[:200]
-        html = f'<pre>{text}</pre>'
-        HTML(string=html).write_png(output_path)
-    img = Image.open(output_path)
-    img.thumbnail((200, 200))
-    img.save(output_path)
+    try:
+        if file_path.endswith(".pdf"):
+            html = f'<iframe src="{file_path}" width="100%" height="100%"></iframe>'
+            HTML(string=html).write_png(output_path)
+        elif file_path.endswith(".txt"):
+            with open(file_path, "r") as f:
+                text = f.read()[:200]
+            html = f'<pre>{text}</pre>'
+            HTML(string=html).write_png(output_path)
+        img = Image.open(output_path)
+        img.thumbnail((200, 200))
+        img.save(output_path)
+    except Exception as e:
+        logger.error(f"Failed to generate screenshot: {e}")
 
 def encrypt_file(file_path, key):
-    cipher = AES.new(key, AES.MODE_EAX)
-    with open(file_path, "rb") as f:
-        data = f.read()
-    ciphertext, tag = cipher.encrypt_and_digest(data)
-    encrypted_path = file_path + ".enc"
-    with open(encrypted_path, "wb") as f:
-        [f.write(x) for x in (cipher.nonce, tag, ciphertext)]
-    return encrypted_path, key
+    try:
+        cipher = AES.new(key, AES.MODE_EAX)
+        with open(file_path, "rb") as f:
+            data = f.read()
+        ciphertext, tag = cipher.encrypt_and_digest(data)
+        encrypted_path = file_path + ".enc"
+        with open(encrypted_path, "wb") as f:
+            [f.write(x) for x in (cipher.nonce, tag, ciphertext)]
+        return encrypted_path, key
+    except Exception as e:
+        logger.error(f"Failed to encrypt file: {e}")
+        return None, None
 
 def get_btc_price():
     try:
@@ -148,11 +164,15 @@ async def list_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Price: {item['price_btc']} BTC / {item['price_btc'] / get_btc_price() * get_xmr_price():.4f} XMR (${item['price_usd']})\n"
             "Only 5 copies left! Grab it before the feds do."
         )
-        await update.message.reply_photo(
-            photo=open(item['thumbnail'], "rb"),
-            caption=caption,
-            reply_markup=reply_markup
-        )
+        try:
+            await update.message.reply_photo(
+                photo=open(item['thumbnail'], "rb"),
+                caption=caption,
+                reply_markup=reply_markup
+            )
+        except Exception as e:
+            logger.error(f"Failed to send photo: {e}")
+            await update.message.reply_text(caption, reply_markup=reply_markup)
 
 async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.from_user.id != ADMIN_ID:
@@ -309,12 +329,14 @@ async def payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not address:
                 await query.message.reply_text("Error generating BTC address. Try XMR.")
                 return
-            context.user_data["pending_order"] = {
+            pending_orders = load_pending_orders()
+            pending_orders.append({
                 "address": address,
                 "item_id": item_id,
                 "user_id": query.from_user.id,
                 "method": "btc"
-            }
+            })
+            save_pending_orders(pending_orders)
             await query.message.reply_text(
                 f"Send {item['price_btc']} BTC to {address}. Link drops when confirmed."
             )
@@ -325,12 +347,14 @@ async def payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(
             f"Send {item['price_btc'] / get_btc_price() * get_xmr_price():.4f} XMR to {XMR_ADDRESS}. Reply with TX ID."
         )
-        context.user_data["pending_order"] = {
+        pending_orders = load_pending_orders()
+        pending_orders.append({
             "address": XMR_ADDRESS,
             "item_id": item_id,
             "user_id": query.from_user.id,
             "method": "xmr"
-        }
+        })
+        save_pending_orders(pending_orders)
 
 # Flask routes
 @app.route("/")
@@ -344,8 +368,9 @@ def callback():
     data = request.json
     if data["status"] == 2:
         address = data["address"]
-        pending = load_inventory().get("pending_order", {})
-        if pending.get("address") == address and pending.get("method") == "btc":
+        pending_orders = load_pending_orders()
+        pending = next((p for p in pending_orders if p["address"] == address and p["method"] == "btc"), None)
+        if pending:
             inventory = load_inventory()
             item = next((i for i in inventory if i["id"] == pending["item_id"]), None)
             if item:
@@ -361,14 +386,17 @@ def callback():
                 save_sales(sales)
                 key = get_random_bytes(16)
                 encrypted_path, key = encrypt_file(item["file_path"], key)
-                bot = Application.builder().token(BOT_TOKEN).build()
-                asyncio.get_event_loop().run_until_complete(
-                    bot.bot.send_document(
-                        chat_id=pending["user_id"],
-                        document=open(encrypted_path, "rb"),
-                        caption=f"Payment confirmed! Encrypted file. Decryption key: {key.hex()}\nUse OpenSSL to decrypt."
+                if encrypted_path and key:
+                    bot = Application.builder().token(BOT_TOKEN).build()
+                    asyncio.get_event_loop().run_until_complete(
+                        bot.bot.send_document(
+                            chat_id=pending["user_id"],
+                            document=open(encrypted_path, "rb"),
+                            caption=f"Payment confirmed! Encrypted file. Decryption key: {key.hex()}\nUse OpenSSL to decrypt."
+                        )
                     )
-                )
+                pending_orders.remove(pending)
+                save_pending_orders(pending_orders)
     return "OK", 200
 
 @app.route("/webhook", methods=["POST"])
@@ -457,45 +485,54 @@ def admin_panel():
 
 @app.route("/add_item", methods=["POST"])
 def add_item():
-    title = request.form["title"]
-    description = request.form["description"]
-    tier = request.form["tier"]
-    price_btc = float(request.form["price_btc"])
-    price_usd = float(request.form["price_usd"])
-    file = request.files["file"]
-    file_path = os.path.join("uploads", file.filename)
-    os.makedirs("uploads", exist_ok=True)
-    file.save(file_path)
-    thumbnail_path = f"thumbnails/{file.filename}.png"
-    os.makedirs("thumbnails", exist_ok=True)
-    generate_screenshot(file_path, thumbnail_path)
-    inventory = load_inventory()
-    item_id = str(len(inventory) + 1)
-    inventory.append({
-        "id": item_id,
-        "title": title,
-        "description": description,
-        "tier": tier,
-        "price_btc": price_btc,
-        "price_usd": price_usd,
-        "file_path": file_path,
-        "thumbnail": thumbnail_path
-    })
-    save_inventory(inventory)
-    return redirect("/admin")
+    try:
+        title = request.form["title"]
+        description = request.form["description"]
+        tier = request.form["tier"]
+        price_btc = float(request.form["price_btc"])
+        price_usd = float(request.form["price_usd"])
+        file = request.files["file"]
+        file_path = os.path.join("uploads", file.filename)
+        os.makedirs("uploads", exist_ok=True)
+        file.save(file_path)
+        thumbnail_path = f"thumbnails/{file.filename}.png"
+        os.makedirs("thumbnails", exist_ok=True)
+        generate_screenshot(file_path, thumbnail_path)
+        inventory = load_inventory()
+        item_id = str(len(inventory) + 1)
+        inventory.append({
+            "id": item_id,
+            "title": title,
+            "description": description,
+            "tier": tier,
+            "price_btc": price_btc,
+            "price_usd": price_usd,
+            "file_path": file_path,
+            "thumbnail": thumbnail_path
+        })
+        save_inventory(inventory)
+        return redirect("/admin")
+    except Exception as e:
+        logger.error(f"Failed to add item: {e}")
+        return "Error adding item", 500
 
 @app.route("/delete_item/<item_id>")
 def delete_item(item_id):
-    inventory = load_inventory()
-    inventory = [i for i in inventory if i["id"] != item_id]
-    save_inventory(inventory)
-    return redirect("/admin")
+    try:
+        inventory = load_inventory()
+        inventory = [i for i in inventory if i["id"] != item_id]
+        save_inventory(inventory)
+        return redirect("/admin")
+    except Exception as e:
+        logger.error(f"Failed to delete item: {e}")
+        return "Error deleting item", 500
 
 # Run Flask in a separate thread for local testing
 def run_flask():
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
 
 async def main():
+    global application
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("list", list_items))
