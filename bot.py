@@ -1,6 +1,8 @@
 import os
 import json
 import requests
+import asyncio
+import nest_asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 from flask import Flask, request, redirect
@@ -13,6 +15,10 @@ import base64
 import random
 import logging
 
+# Apply nest_asyncio for local testing to handle nested event loops
+nest_asyncio.apply()
+
+# Bot and payment configuration
 BOT_TOKEN = "8132539541:AAFTibgRmTRfUZJhDFkbHzzXD8yG1KHs8Dg"  # Replace with BotFather token
 BLOCKONOMICS_API_KEY = "A1Jo0fa6eNXZ7Ajc07IBYiqHALMqTFvF7AaAJNS56k0"  # Replace with Blockonomics API key
 CALLBACK_SECRET = "nullbotsecret666"  # Replace with your callback secret
@@ -203,6 +209,28 @@ async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Subscribe for daily dark web alerts: 0.005 XMR/month to {XMR_ADDRESS}. Reply with TX ID."
     )
 
+async def poison(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"Poison a dataset with fake CCs for 0.02 BTC. Send to [BTC_ADDRESS] and reply with TX ID."
+    )
+
+async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    sales = load_sales()
+    top_buyers = {}
+    for sale in sales:
+        user_id = sale["user_id"]
+        top_buyers[user_id] = top_buyers.get(user_id, 0) + 1
+    leaderboard = "\n".join(f"User {k}: {v} scores" for k, v in sorted(top_buyers.items(), key=lambda x: x[1], reverse=True)[:5])
+    await update.message.reply_text(f"Top Operatives:\n{leaderboard}\nJoin the ranks at /list.")
+
+async def alert(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Urgent: New 10M CC leak! Buy now at /list before it’s gone.")
+
+async def radio(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Tune into NullBot Radio: Cyberpunk tracks to fuel your hacks. Try /list for the real vibes."
+    )
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "pending_black_market" in context.user_data:
         tx_id = update.message.text
@@ -273,11 +301,11 @@ async def payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "user_id": query.from_user.id,
             "method": "btc"
         }
-        await update.message.reply_text(
+        await query.message.reply_text(
             f"Send {item['price_btc']} BTC to {address}. Link drops when confirmed."
         )
     else:  # XMR
-        await update.message.reply_text(
+        await query.message.reply_text(
             f"Send {item['price_btc'] / get_btc_price() * get_xmr_price():.4f} XMR to {XMR_ADDRESS}. Reply with TX ID."
         )
         context.user_data["pending_order"] = {
@@ -313,13 +341,11 @@ def callback():
                 key = get_random_bytes(16)
                 encrypted_path, key = encrypt_file(item["file_path"], key)
                 bot = Application.builder().token(BOT_TOKEN).build()
-                bot.loop.run_until_complete(
-                    bot.loop.create_task(
-                        bot.bot.send_document(
-                            chat_id=pending["user_id"],
-                            document=open(encrypted_path, "rb"),
-                            caption=f"Payment confirmed! Encrypted file. Decryption key: {key.hex()}\nUse OpenSSL to decrypt."
-                        )
+                asyncio.get_event_loop().run_until_complete(
+                    bot.bot.send_document(
+                        chat_id=pending["user_id"],
+                        document=open(encrypted_path, "rb"),
+                        caption=f"Payment confirmed! Encrypted file. Decryption key: {key.hex()}\nUse OpenSSL to decrypt."
                     )
                 )
     return "OK", 200
@@ -435,9 +461,9 @@ def delete_item(item_id):
     save_inventory(inventory)
     return redirect("/admin")
 
-# Run Flask and Telegram bot
+# Run Flask in a separate thread for local testing
 def run_flask():
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
 
 async def main():
     application = Application.builder().token(BOT_TOKEN).build()
@@ -454,12 +480,19 @@ async def main():
     application.add_handler(CommandHandler("custom", custom))
     application.add_handler(CommandHandler("auction", auction))
     application.add_handler(CommandHandler("subscribe", subscribe))
+    application.add_handler(CommandHandler("poison", poison))
+    application.add_handler(CommandHandler("leaderboard", leaderboard))
+    application.add_handler(CommandHandler("alert", alert))
+    application.add_handler(CommandHandler("radio", radio))
     application.add_handler(CallbackQueryHandler(button_callback, pattern="^buy_"))
     application.add_handler(CallbackQueryHandler(payment_callback, pattern="^pay_"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     await application.run_polling()
 
 if __name__ == "__main__":
-    Thread(target=run_flask).start()
-    import asyncio
+    # Start Flask in a separate thread
+    flask_thread = Thread(target=run_flask)
+    flask_thread.daemon = True  # Ensure thread exits when main program does
+    flask_thread.start()
+    # Run Telegram bot
     asyncio.run(main())
