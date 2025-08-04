@@ -5,6 +5,7 @@ import asyncio
 import nest_asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
+from telegram.error import NetworkError
 from flask import Flask, request, redirect
 from threading import Thread
 from PIL import Image
@@ -14,11 +15,11 @@ from Crypto.Random import get_random_bytes
 import base64
 import random
 import logging
+import time
 
-# Apply nest_asyncio for local testing to handle nested event loops
+# Apply nest_asyncio for local testing
 nest_asyncio.apply()
 
-# Bot and payment configuration
 BOT_TOKEN = "8132539541:AAFTibgRmTRfUZJhDFkbHzzXD8yG1KHs8Dg"  # Replace with BotFather token
 BLOCKONOMICS_API_KEY = "A1Jo0fa6eNXZ7Ajc07IBYiqHALMqTFvF7AaAJNS56k0"  # Replace with Blockonomics API key
 CALLBACK_SECRET = "nullbotsecret666"  # Replace with your callback secret
@@ -28,6 +29,7 @@ INVENTORY_FILE = "inventory.json"
 SALES_FILE = "sales.json"
 BLACK_MARKET_USERS_FILE = "black_market_users.json"
 DISCOUNTS_FILE = "discounts.json"
+WEBHOOK_URL = 'http://127.0.0.1:5000'  # Replace with your Render URL
 
 # Initialize Flask
 app = Flask(__name__)
@@ -94,20 +96,32 @@ def encrypt_file(file_path, key):
     return encrypted_path, key
 
 def get_btc_price():
-    response = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd")
-    return response.json()["bitcoin"]["usd"]
+    try:
+        response = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd", timeout=5)
+        response.raise_for_status()
+        return response.json()["bitcoin"]["usd"]
+    except requests.RequestException as e:
+        logger.error(f"Failed to fetch BTC price: {e}")
+        return 50000  # Fallback price
 
 def get_xmr_price():
-    response = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=monero&vs_currencies=usd")
-    return response.json()["monero"]["usd"]
+    try:
+        response = requests.get("https://api.coingecko.com/api/v3/simple/price?ids=monero&vs_currencies=usd", timeout=5)
+        response.raise_for_status()
+        return response.json()["monero"]["usd"]
+    except requests.RequestException as e:
+        logger.error(f"Failed to fetch XMR price: {e}")
+        return 150  # Fallback price
 
 # Telegram commands
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_message = """
-╦═╗─╔╗────╔╗
-║╬╬╗╠╬╗╔╦╗╠╩╗
-║╔╬╩╠╩╩╩╠╬╩╠═╩╦╗
-╚╩╩╩╩╩╩╩╩╩╩╩╩╩
+████████╗████████╗██╗    ██╗
+╚══██╔══╝╚══██╔══╝██║    ██║
+   ██║      ██║   ██║ █╗ ██║
+   ██║      ██║   ██║███╗██║
+   ██║      ██║   ╚███╔███╔╝
+   ╚═╝      ╚═╝    ╚══╝╚══╝ 
 Welcome to Tax The World NullBot ☠️—where the dark web thrives.
 Browse stolen CCs, PII, and hacking guides with /list.
 Test your skills with /hack, unlock the Black Market with /join_black_market.
@@ -283,27 +297,30 @@ async def payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text("Item gone. The dark web moves fast.")
         return
     if method == "btc":
-        response = requests.post(
-            "https://www.blockonomics.co/api/new_address",
-            headers={"Authorization": f"Bearer {BLOCKONOMICS_API_KEY}"},
-            json={"callback": f"https://your-bot-host/callback?secret={CALLBACK_SECRET}"}
-        )
-        if response.status_code != 200:
+        try:
+            response = requests.post(
+                "https://www.blockonomics.co/api/new_address",
+                headers={"Authorization": f"Bearer {BLOCKONOMICS_API_KEY}"},
+                json={"callback": f"https://your-bot-host/callback?secret={CALLBACK_SECRET}"},
+                timeout=5
+            )
+            response.raise_for_status()
+            address = response.json().get("address")
+            if not address:
+                await query.message.reply_text("Error generating BTC address. Try XMR.")
+                return
+            context.user_data["pending_order"] = {
+                "address": address,
+                "item_id": item_id,
+                "user_id": query.from_user.id,
+                "method": "btc"
+            }
+            await query.message.reply_text(
+                f"Send {item['price_btc']} BTC to {address}. Link drops when confirmed."
+            )
+        except requests.RequestException as e:
+            logger.error(f"Failed to generate BTC address: {e}")
             await query.message.reply_text("Error generating BTC address. Try XMR.")
-            return
-        address = response.json().get("address")
-        if not address:
-            await query.message.reply_text("Error generating BTC address. Try XMR.")
-            return
-        context.user_data["pending_order"] = {
-            "address": address,
-            "item_id": item_id,
-            "user_id": query.from_user.id,
-            "method": "btc"
-        }
-        await query.message.reply_text(
-            f"Send {item['price_btc']} BTC to {address}. Link drops when confirmed."
-        )
     else:  # XMR
         await query.message.reply_text(
             f"Send {item['price_btc'] / get_btc_price() * get_xmr_price():.4f} XMR to {XMR_ADDRESS}. Reply with TX ID."
@@ -353,6 +370,16 @@ def callback():
                     )
                 )
     return "OK", 200
+
+@app.route("/webhook", methods=["POST"])
+async def webhook():
+    try:
+        update = Update.de_json(request.get_json(force=True), application.bot)
+        await application.process_update(update)
+        return "OK", 200
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+        return "Error", 500
 
 @app.route("/admin")
 def admin_panel():
@@ -490,12 +517,30 @@ async def main():
     application.add_handler(CallbackQueryHandler(button_callback, pattern="^buy_"))
     application.add_handler(CallbackQueryHandler(payment_callback, pattern="^pay_"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    await application.run_polling()
+    # Retry initialization on network error
+    for attempt in range(3):
+        try:
+            await application.initialize()
+            break
+        except NetworkError as e:
+            logger.error(f"Network error during initialization: {e}. Retrying in 5 seconds...")
+            await asyncio.sleep(5)
+    else:
+        raise NetworkError("Failed to initialize bot after 3 attempts due to network issues.")
+    return application
 
 if __name__ == "__main__":
-    # Start Flask in a separate thread for local testing
+    # Start Flask in a separate thread
     flask_thread = Thread(target=run_flask)
-    flask_thread.daemon = True  # Ensure thread exits when main program does
+    flask_thread.daemon = True
     flask_thread.start()
-    # Run Telegram bot
-    asyncio.run(main())
+    # Run Telegram bot with polling
+    try:
+        application = asyncio.run(main())
+        asyncio.run(application.run_polling())
+    except NetworkError as e:
+        logger.error(f"Bot failed to start: {e}")
+        print("Network error. Check your internet connection and DNS settings.")
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        print("An unexpected error occurred. Check logs for details.")
