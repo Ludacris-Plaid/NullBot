@@ -315,7 +315,11 @@ async def payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "method": "xmr"
         }
 
-# Blockonomics callback
+# Flask routes
+@app.route("/")
+def home():
+    return "Tax The World NullBot ☠️: Access /admin for control."
+
 @app.route("/callback", methods=["POST"])
 def callback():
     if request.args.get("secret") != CALLBACK_SECRET:
@@ -350,7 +354,6 @@ def callback():
                 )
     return "OK", 200
 
-# Flask admin panel
 @app.route("/admin")
 def admin_panel():
     inventory = load_inventory()
@@ -490,7 +493,7 @@ async def main():
     await application.run_polling()
 
 if __name__ == "__main__":
-    # Start Flask in a separate thread
+    # Start Flask in a separate thread for local testing
     flask_thread = Thread(target=run_flask)
     flask_thread.daemon = True  # Ensure thread exits when main program does
     flask_thread.start()
